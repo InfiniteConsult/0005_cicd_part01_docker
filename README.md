@@ -532,3 +532,290 @@ After that, we will use our "Control Center" to build our complete CI/CD "city,"
 
 10. **Article 10: The Python API Package (Capstone)**
     * **Role**: The "Master Control Package." Throughout the series, we will build a professional Python library from within our "Control Center". Each new article will add a module to this package for controlling that component's API (e.g., adding users to GitLab, creating jobs in Jenkins). This capstone article will showcase our finished package, using it to automate the entire stack and perform complex, cross-service operations.
+
+# Chapter 2: Docker Networking (The "Roads")
+
+## 2.1 The "Default Isolation" Problem
+
+We have successfully built our "Control Center". We now possess a permission-safe, reproducible environment from which we can send `docker` commands to our host's daemon. We are the "city planner" in our central office, ready to build our "city."
+
+But we immediately face our next fundamental "pain point." If we simply run our services, they will be completely isolated from each other. A default Docker container is a "black box," and by design, it cannot see or speak to its neighbors. This is useless for our CI/CD stack. Our Jenkins container *must* be able to find and communicate with our GitLab container, which *must* be able to send notifications to our Mattermost container.
+
+To build a functioning stack, we must first understand *why* this isolation exists and then build a private "phone system" to connect our services.
+
+> **The Analogy: "The Private Hotel Room"**
+>
+> A new Docker container is like a soundproof, private hotel room. It has a main door to the "outside world" (the internet), which is why you can `apt update` or `curl google.com` from inside a new container.
+>
+> But it has no phone and no adjoining doors to the other rooms in the hallway. You, in the "Jenkins" room (Room 101), have no way to find the "GitLab" room (Room 102). You can't even tell if Room 102 exists, let alone call it by its name. We must lay the "wiring" for an internal phone system.
+
+## 2.2 The Default `bridge` Network
+
+When you install Docker on your Linux host, it creates a virtual Ethernet bridge called **`docker0`**. You can see this on your host machine by running the `ip a` command. This `docker0` interface acts as a simple virtual switch. By default, every container you run is "plugged into" this switch with a virtual cable, allowing them to communicate *if* they know each other's exact IP address.
+
+This default network, however, is a legacy component. By design, it **does not include an embedded DNS server**. It was built for an older, deprecated linking system, not for modern, automatic service discovery. This is a deliberate design choice to maintain backward compatibility, and it's the source of our "pain point." Containers on this network *cannot* find each other by name.
+
+Let's prove this from our "Control Center". We will run two simple `debian:12` containers on the default network.
+
+```bash
+# (Inside dev-container)
+# 1. Run two simple Debian containers on the default network
+docker run -d --name helper-a debian:12 sleep 3600
+docker run -d --name helper-b debian:12 sleep 3600
+
+# 2. Install 'ping' in the 'helper-b' container
+#    We suppress output with -qq for a cleaner log
+docker exec -it helper-b apt update -qq
+docker exec -it helper-b apt install -y -qq iputils-ping
+```
+
+Now that both containers are running and `helper-b` has the `ping` command, let's try to have `helper-b` contact `helper-a` using its name.
+
+```bash
+# (Inside dev-container)
+# 3. Try to ping 'helper-a' by its name
+docker exec -it helper-b ping helper-a
+```
+
+**Result:**
+
+```
+ping: bad address 'helper-a'
+```
+
+This failure is the key takeaway. Because the default `bridge` has no DNS, `helper-b` has no way to resolve the name `helper-a` to an IP address. This makes the default network useless for our stack.
+
+Let's clean up our failed experiment.
+
+```bash
+# (Inside dev-container)
+docker rm -f helper-a helper-b
+```
+
+## 2.3 The Solution: Custom `bridge` Networks
+
+This is the best practice for all modern Docker applications. A **user-defined `bridge` network** is functionally similar to the default one, but it adds one critical, game-changing feature: **automatic DNS resolution** based on container names.
+
+### The "First Principles" of Embedded DNS
+
+When you create a custom `bridge` network, the Docker daemon (`dockerd`) itself provides a built-in, lightweight DNS server for *that network only*.
+
+Here's how it works:
+
+1.  Docker automatically configures every container on that custom network to use this special DNS server. It does this by mounting a virtual `/etc/resolv.conf` file inside the container that points to `nameserver 127.0.0.11`.
+2.  This `127.0.0.11` address is a special loopback IP *within the container's namespace*. The Docker daemon intercepts all DNS queries sent to this address.
+3.  The daemon maintains a "phone book" (a lookup table) for that specific network, instantly mapping container names (like `gitlab`) to their internal IP addresses.
+
+> **The Analogy: "The Private Office VLAN"**
+>
+> Creating a custom `bridge` network is like putting all your servers on a private office network that comes with its own internal phone directory (the embedded DNS). The default `bridge` is a network *without* this directory.
+
+### Pedagogical Example: The Custom Bridge Success
+
+Let's repeat our experiment, but this time we'll create our own "phone system."
+
+```bash
+# (Inside dev-container)
+# 1. Create the network
+docker network create my-test-net
+
+# 2. Run containers attached to the new network
+docker run -d --network my-test-net --name test-a debian:12 sleep 3600
+docker run -d --network my-test-net --name test-b debian:12 sleep 3600
+
+# 3. Install 'ping' in the 'test-b' container
+docker exec -it test-b apt update -qq
+docker exec -it test-b apt install -y -qq iputils-ping
+```
+
+Now, let's try the same `ping` command that failed before.
+
+```bash
+# (Inside dev-container)
+# 4. Try to ping by name again (this will succeed)
+docker exec -it test-b ping test-a
+```
+
+**Result:**
+
+```
+PING test-a (172.19.0.2): 56(84) bytes of data.
+64 bytes from test-a.my-test-net (172.19.0.2): icmp_seq=1 ttl=64 time=0.100 ms
+...
+```
+
+This success is the foundation of our entire CI/CD stack. The embedded DNS server on `my-test-net` successfully resolved the name `test-a` to its internal IP address.
+
+Let's prove the "magic" by inspecting the DNS configuration *inside* the `test-b` container.
+
+```bash
+# (Inside dev-container)
+# 5. Look at the DNS configuration file
+docker exec -it test-b cat /etc/resolv.conf
+```
+
+**Result:**
+
+```
+nameserver 127.0.0.11
+options ndots:0
+```
+
+This confirms our "first principles" explanation. The container is configured to use the internal `127.0.0.11` resolver, which is how it found `test-a`.
+
+**Cleanup:**
+
+```bash
+# (Inside dev-container)
+docker rm -f test-a test-b
+docker network rm my-test-net
+```
+
+## 2.4 Driver 2: The `host` Network (No Isolation)
+
+The `host` driver is the most extreme option. It provides the highest possible network performance by completely removing all network isolation between the container and the host. The container effectively "tears down its own walls" and attaches directly to your host machine's network stack.
+
+> **The Analogy: "The Open-Plan Office"**
+>
+> Using the `host` network is like putting your container not in a private room, but at a desk right next to your host OS in an open-plan office. It shares the same network connection, it can hear all the "conversations" (network traffic), and all the host's ports are *its* ports.
+
+This approach is fundamentally insecure and creates immediate, tangible risks. A process inside the container can:
+
+* **Access `localhost` Services**: It can connect directly to any service running on your host's `localhost` or `127.0.0.1`, such as a database or web server you thought was private.
+* **Cause Port Conflicts**: If your host is running a service on port 8080, and you try to start a `host` network container that also wants port 8080, the container will fail to start.
+* **Sniff Host Traffic**: A compromised container can potentially monitor all network traffic on your host machine.
+
+Let's prove the `localhost` access risk. This experiment requires two terminals.
+
+**Terminal 1 (Host Machine):**
+First, on your **host machine's** terminal (not inside the `dev-container`), start a simple Python web server.
+
+```bash
+# (Run on HOST)
+# This requires Python 3 to be installed on your host
+python3 -m http.server 8000
+```
+
+**Result:**
+
+```
+Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...
+```
+
+This server is now running on your host, bound to `localhost:8000`.
+
+**Terminal 2 (dev-container):**
+Now, from your `dev-container` "Control Center," run a new temporary `debian:12` container using the `--network host` flag.
+
+```bash
+# (Inside dev-container)
+# 1. Run a temporary container on the 'host' network
+docker run -it --rm --network host debian:12 bash
+
+# (Inside debian container)
+# 2. Install curl
+root@...:/# apt update -qq && apt install -y -qq curl
+
+# 3. Try to access the host's localhost
+root@...:/# curl http://localhost:8000
+```
+
+**Result:**
+You will immediately see the HTML directory listing from the Python server that is running *on your host*.
+
+**Explanation:**
+This proves the container has full access to the host's network stack. It's powerful for niche, high-performance applications, but for our CI/CD stack, this lack of isolation is an unacceptable security risk and a source of future port conflicts.
+
+**Cleanup:**
+
+1.  In the `debian` container, type `exit`.
+2.  In your host terminal, press `Ctrl+C` to stop the Python server.
+
+## 2.5 Driver 3: The `none` Network (Total Isolation)
+
+This driver provides the most extreme form of isolation. When you attach a container to the `none` network, Docker creates the container with *only* a loopback interface (`lo`). It has no `eth0` interface and no "virtual cable" plugging it into any switch. It cannot communicate with other containers or the outside world.
+
+> **The Analogy: "Solitary Confinement"**
+>
+> A container on the `none` network is in a room with no doors and no windows. It can only talk to itself (via `localhost`).
+
+This is not a mistake; it's a powerful security feature. This is the perfect driver for secure, sandboxed batch jobs. Imagine a container that only needs to read a file from a mounted volume, perform a complex calculation on it, and write a result back to a volume. By attaching it to the `none` network, you can *guarantee* that this process has zero network access, eliminating an entire class of potential vulnerabilities.
+
+Let's verify this total isolation.
+
+```bash
+# (Inside dev-container)
+# 1. Run a temporary container on the 'none' network
+docker run -it --rm --network none debian:12 bash
+```
+
+Now, let's try to do *anything* network-related, starting with updating the package manager.
+
+```bash
+# (Inside debian container)
+# 2. Try to update apt
+root@...:/# apt update -qq
+```
+
+**Result:**
+
+```
+W: Failed to fetch http://deb.debian.org/debian/dists/bookworm/InRelease  Temporary failure resolving 'deb.debian.org'
+W: Failed to fetch http://deb.debian.org/debian/dists/bookworm-updates/InRelease  Temporary failure resolving 'deb.debian.org'
+W: Failed to fetch http://deb.debian.org/debian-security/dists/bookworm-security/InRelease  Temporary failure resolving 'deb.debian.org'
+W: Some index files failed to download. They have been ignored, or old ones used instead.
+```
+
+**Explanation:** This failure is the perfect proof. The container has no network stack, so it can't even resolve the DNS for `deb.debian.org` to find its package repositories. This also means we can't install tools like `ping` or `iproute2` to investigate further.
+
+```bash
+# (Inside debian container)
+# 3. Try to use common network tools (which aren't installed)
+root@...:/# ip a
+bash: ip: command not found
+
+root@...:/# ping -c 1 8.8.8.8
+bash: ping: command not found
+```
+
+**Explanation:** We are in "solitary confinement." We can't reach the outside world to install new tools. This is clearly not useful for our interconnected CI/CD services, but it's a critical tool for security-hardening.
+
+**Cleanup:**
+
+```bash
+# (Inside debian container)
+root@...:/# exit
+```
+
+## 2.6 Advanced Drivers: `macvlan` and `ipvlan`
+
+Finally, there are advanced drivers for niche use cases where containers need to appear as if they are physically on your local network.
+
+> **The Analogy: "A Physical Mailbox"**
+>
+> Instead of sharing the apartment building's mailroom (the host's IP), these drivers give a container its own physical street address (a unique IP on your LAN). Your home router will see the container as just another device, like your phone or laptop.
+
+These drivers are powerful but complex. The fundamental difference between them is:
+
+* **`macvlan` (Layer 2)**: This gives the container its own unique **MAC address** (a physical hardware address). It truly appears as a separate physical device on the network.
+* **`ipvlan` (Layer 3)**: This is a more subtle approach. All containers **share the host's MAC address**, but the kernel routes traffic to the correct container based on its unique IP address.
+
+### The `macvlan` "Wi-Fi" Pain Point
+
+`macvlan` is notoriously fragile and **fails on almost all Wi-Fi networks**. This is a common "gotcha" for developers trying to use it on a laptop.
+
+The reason is a "first principles" security feature of Wi-Fi. A Wi-Fi access point is designed to allow only *one* MAC address (your laptop's) to communicate per connection. When `macvlan` tries to send packets from *new* virtual MAC addresses, the access point sees this as a spoofing attack and drops the packets.
+
+Interestingly, **`ipvlan` often works on Wi-Fi** because it cleverly uses the *host's single, approved MAC address* for all its packets.
+
+These drivers are for legacy applications that must be on the physical network or for complex network segmentation. This is far more complexity than we need for our self-contained stack.
+
+---
+
+## 2.7 Chapter 2 Conclusion: Our Choice
+
+We've explored the four main types of Docker networking. We proved that the **default `bridge` network** is useless for our stack because it **lacks DNS**. We saw that `host` is insecure, `none` is too isolated, and `macvlan`/`ipvlan` are unnecessarily complex.
+
+Our choice is clear: the **Custom `bridge` Network** is the only one that provides the perfect balance of **isolation** from the host and **service discovery (DNS)** between our containers.
+
+In our final "Action Plan," we will create one single, permanent, custom `bridge` network named **`cicd-net`** that all our services will share.
