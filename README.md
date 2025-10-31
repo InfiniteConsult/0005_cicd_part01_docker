@@ -1640,3 +1640,27 @@ Scroll down in the JSON output until you find the `"Networks"` block. You will n
 ```
 
 **Explanation:** This confirms our "Control Center" is successfully connected to our "CI/CD City" network. It can now act as our central orchestrator for all other services.
+
+# Chapter 5: Conclusion
+
+## 5.1 What We've Built
+
+We have now laid the complete, professional foundation for our entire 10-article series. We have successfully deconstructed Docker's "first principles" to build a robust platform, solving the critical "pain points" of a default setup.
+
+Let's review what we've built:
+* A **DooD-enabled "Control Center"**: Our `dev-container` is now a fully permission-safe environment, capable of controlling the host Docker daemon from *any* session, including SSH.
+* A **Persistent `cicd-net` Network**: We have a private, isolated "road network" with its own subnet and, most importantly, an embedded DNS server for automatic service discovery.
+* A **`~/cicd_stack` Configuration Repository**: We have a host-side directory ready for our Configuration-as-Code (CaC) workflow, with permissions pre-emptively set to avoid future "permission denied" errors.
+* **Externally-Managed Volumes**: We have a set of persistent "storage lockers" (like `gitlab-data` and `jenkins-home`) that are decoupled from our container lifecycles, protecting our future data from accidental deletion.
+
+---
+
+## 5.2 Next Steps
+
+Our "city" is now ready. The "Control Center" is built, the "roads" are paved, and the "foundations" are poured.
+
+But we have a new problem. Our city has no security.
+
+When we deploy GitLab and Jenkins, they will communicate over our `cicd-net` network using plain, unencrypted `http`. This is insecure, unprofessional, and does not emulate a real-world environment. Our browser will show "Not Secure" warnings, and our tools will complain about unverified connections.
+
+In the next article, we will solve this "security pain point" from first principles. We will not use "magic" self-signed certificates. Instead, we will become our own **Certificate Authority (CA)**. We will use `openssl` to create a local root of trust, which we will then use to issue valid, trusted HTTPS certificates for every single service we deploy.
