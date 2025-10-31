@@ -1255,3 +1255,388 @@ A professional stack does not choose just one. It uses a **hybrid strategy** tha
 
 **What**: We will keep the **`tmpfs` mount** in our toolkit.
 **Why**: When we encounter services that need to handle temporary, sensitive data (like private keys or caches) that should *never* be written to disk, we will use a `tmpfs` mount to ensure that data lives only in RAM and is instantly erased when the container stops.
+
+
+# Chapter 4: Action Plan - Laying the Foundation
+
+## 4.1 Our "City Plan": A Summary
+
+We have now explored the "first principles" of Docker's architecture. We deconstructed the "why" and "what" behind our "city's" infrastructure, proving *why* the default Docker setup is insufficient for a professional stack.
+
+We proved that a default container is **isolated**, unable to find its neighbors via DNS. We proved that it is **ephemeral**, losing all its data when removed. And we proved that a non-privileged user cannot access the Docker daemon due to **permission mismatches**.
+
+Now it is time to execute the "how."
+
+Our final architecture, our "city plan," consists of three parts. We have already completed the first in Chapter 1, and we will now build the next two:
+
+1.  **A "Control Center" (Done)**: Our `dev-container` is configured with a permission-safe Docker-out-of-Docker (DooD) capability, giving us the "remote control" for our entire stack.
+2.  **A "Road Network"**: We will create one single, custom `bridge` network named `cicd-net` for all our services.
+3.  **The "Foundations"**: We will implement our **Hybrid Persistence Strategy** by creating host directories for our bind mounts and named volumes for our application data.
+
+All the following commands will be run from *inside* your `dev-container` "Control Center" unless specified otherwise.
+
+## 4.2 Step 1: Create the "Road Network" (`cicd-net`)
+
+Our first action is to build the "private road network" that all our services will share.
+
+We *could* just run `docker network create cicd-net`. However, this is not a professional-grade solution. By default, Docker would assign a random subnet (e.g., `172.18.0.0/16`), which could one day conflict with your home network, your office VPN, or even the default `docker0` bridge (which is `172.17.0.1/16`).
+
+A "first principles" approach means being explicit. We will define our own private subnet to guarantee there are no IP conflicts, demonstrating a professional, non-conflicting setup.
+
+We will place this command in its own file, `01-create-network.sh`.
+
+### `01-create-network.sh`
+
+This script will contain the command to create our network.
+
+```bash
+#!/usr/bin/env bash
+
+# Create our "city network"
+docker network create \
+  --driver bridge \
+  --subnet "172.30.0.0/24" \
+  --gateway "172.30.0.1" \
+  cicd-net
+```
+
+### Deconstruction
+
+* `--driver bridge`: We are explicitly stating we want a `bridge` driver, even though it's the default. This makes our script's intent clear.
+* `--subnet "172.30.0.0/24"`: This is the most important flag. We are "zoning" a private "neighborhood" for our city. This private range is reserved for our CI/CD stack, guaranteeing it will never conflict with your `10.0.0.x` host network or the `172.17.0.x` default Docker network.
+* `--gateway "172.30.0.1"`: This gives our network a predictable "front door" or "router IP" at `172.30.0.1`.
+* `cicd-net`: The human-readable name of our network.
+
+### Action and Verification
+
+Now, from *inside your `dev-container`*, make the script executable and run it.
+
+```bash
+# (Inside dev-container)
+# Make the script executable
+chmod +x 01-create-network.sh
+
+# Run the script
+./01-create-network.sh
+```
+
+**Result:**
+
+```
+<long_hash_of_the_network_id>
+```
+
+To verify its creation, you can now inspect the network:
+
+```bash
+# (Inside dev-container)
+docker network inspect cicd-net
+```
+
+You will see a JSON output confirming that our network exists and is configured with the exact `Subnet` and `Gateway` we specified.
+
+
+## 4.3 Step 2: Create the "Foundations" (Persistence)
+
+With our "road network" in place, we will now lay the "foundations" for our buildings. This is our **Hybrid Persistence Strategy**, and we will implement it in two parts.
+
+### 4.3.1 Part A: The "Portals" (Bind Mounts for Config)
+
+First, we will create the "portals" for our configuration. These are the directories on our **host machine** that we will "bind mount" into our containers.
+
+This is the core of our **Configuration-as-Code (CaC)** strategy. The `~/cicd_stack` directory isn't just a folder; it's a **Git repository**. By keeping all our config files (like `jenkins.yaml`, `prometheus.yml`) here, we can version control, audit, and roll back our entire stack's configuration.
+
+However, this strategy comes with a critical "pain point" that we must solve *now*: **permissions**.
+
+The `~/cicd_stack` directory you just created is owned by *your* host user (e.g., `warren`, UID 1000). But our service containers will run as their *own* internal, non-root users. For example:
+
+* The Jenkins container runs as the `jenkins` user (UID `1000`).
+* The Grafana container runs as the `grafana` user (UID `472`).
+* The Prometheus container runs as the `nobody` user (UID `65534`).
+
+If we don't fix this, when we try to run Grafana in a later article, it will get a "permission denied" error when it tries to read the config file from the bind mount.
+
+We will solve this problem *pre-emptively* by creating a script that not only creates the directories but also sets their ownership to match the *exact* user that will be inside the container.
+
+We will call this script `02-create-bind-mounts.sh`. This script **must be run on your host machine**, as it's managing the host-side filesystem.
+
+### `02-create-bind-mounts.sh`
+
+```bash
+#!/usr/bin/env bash
+
+# This script must be run on the HOST, not in the dev-container.
+# It creates the directory structure for our bind-mounted
+# configuration files and sets the correct permissions
+# to prevent "permission denied" errors in our services.
+
+# Create the root directory
+echo "--- Creating root cicd_stack directory ---"
+mkdir -p ~/cicd_stack
+
+# --- Create sub-directories and set permissions ---
+
+# 1. Local CA (run by host user, so no chown needed)
+echo "--- Creating Local CA directory ---"
+mkdir -p ~/cicd_stack/ca
+
+# 2. GitLab (runs as root internally, but config is flexible)
+echo "--- Creating GitLab directory ---"
+mkdir -p ~/cicd_stack/gitlab/config
+
+# 3. Jenkins (runs as jenkins, UID 1000)
+echo "--- Creating Jenkins directory (UID: 1000) ---"
+mkdir -p ~/cicd_stack/jenkins/config
+sudo chown -R 1000:1000 ~/cicd_stack/jenkins
+
+# 4. Artifactory (runs as artifactory, UID 1030)
+echo "--- Creating Artifactory directory (UID: 1030) ---"
+mkdir -p ~/cicd_stack/artifactory/config
+sudo chown -R 1030:1030 ~/cicd_stack/artifactory
+
+# 5. SonarQube (runs as sonarqube, a non-root user, often 1000 or similar)
+# We will use 1000 as a safe default.
+echo "--- Creating SonarQube directory (UID: 1000) ---"
+mkdir -p ~/cicd_stack/sonarqube/config
+sudo chown -R 1000:1000 ~/cicd_stack/sonarqube
+
+# 6. Mattermost (runs as mattermost, UID 1000)
+echo "--- Creating Mattermost directory (UID: 1000) ---"
+mkdir -p ~/cicd_stack/mattermost/config
+sudo chown -R 1000:1000 ~/cicd_stack/mattermost
+
+# 7. ELK - Logstash (runs as logstash, UID 1000)
+echo "--- Creating ELK/Logstash directory (UID: 1000) ---"
+mkdir -p ~/cicd_stack/elk/logstash
+sudo chown -R 1000:1000 ~/cicd_stack/elk/logstash
+
+# 8. Prometheus (runs as nobody, UID 65534)
+echo "--- Creating Prometheus directory (UID: 65534) ---"
+mkdir -p ~/cicd_stack/prometheus/config
+sudo chown -R 65534:65534 ~/cicd_stack/prometheus
+
+# 9. Grafana (runs as grafana, UID 472)
+echo "--- Creating Grafana directory (UID: 472) ---"
+mkdir -p ~/cicd_stack/grafana/config
+sudo chown -R 472:472 ~/cicd_stack/grafana
+
+echo "--- Directory structure created successfully ---"
+ls -ld ~/cicd_stack/*/
+```
+
+### Deconstruction
+
+* `sudo chown -R 1000:1000 ~/cicd_stack/jenkins`: This is the solution. The `-R` (recursive) flag changes the ownership (user and group) of the `jenkins` directory to `1000:1000`. When the Jenkins container starts as user `1000`, it will now have full read/write access to this "portal."
+* We repeat this `chown` for each service, using the specific UID we discovered in our research (like `472` for Grafana and `65534` for Prometheus).
+
+### Action
+
+From your **host machine's terminal**, make this script executable and run it.
+
+```bash
+# (Run on HOST)
+chmod +x 02-create-bind-mounts.sh
+./02-create-bind-mounts.sh
+```
+
+**Result:**
+You will see the script create each directory and set its permissions. The final `ls -ld` command will show you a list of the directories and their new, correct owners. You have now pre-emptively solved nine future "permission denied" errors.
+
+
+### 4.3.2 Part B: The "Storage Lockers" (Named Volumes for Data)
+
+Now we will implement the second half of our hybrid strategy: creating the "smart storage lockers" for our application data.
+
+This is a critical step for **data safety**. We *could* just let Docker Compose create these volumes automatically when we launch our services. However, this creates a dangerous "pain point":
+
+**The "Accidental Deletion" Pain Point**: When volumes are created automatically by `docker-compose`, they are "owned" by that Compose stack. A very common command for developers is `docker-compose down -v`, which tells Compose to "tear down the stack and *delete all associated volumes*." Running this command would **permanently destroy your entire GitLab database, all your Jenkins jobs, and all your Artifactory artifacts.**
+
+We will prevent this by creating the volumes *manually* beforehand. This makes them "external" to any Compose stack. Now, if you run `docker-compose down -v`, Docker will refuse to delete these volumes because they were not "owned" by that stack. This simple, one-time action permanently decouples our data's lifecycle from our container's lifecycle, which is a professional data-safety practice.
+
+We will place these commands in a new script, `03-create-volumes.sh`.
+
+### `03-create-volumes.sh`
+
+This script will create the named volumes for all the services that require persistent, opaque data storage, based on our research.
+
+```bash
+#!/usr/bin/env bash
+
+# This script creates all the Docker-managed volumes
+# needed for our CI/CD stack.
+# By creating them manually *before* we launch services,
+# we decouple the data's lifecycle from the container's
+# lifecycle, protecting it from accidental deletion.
+
+echo "--- Creating persistent volumes for CI/CD stack ---"
+
+# GitLab
+docker volume create gitlab-data
+docker volume create gitlab-logs
+
+# Jenkins
+docker volume create jenkins-home
+
+# Artifactory
+docker volume create artifactory-data
+
+# SonarQube
+docker volume create sonarqube-data
+docker volume create sonarqube-extensions
+
+# Mattermost
+docker volume create mattermost-data
+
+# ELK Stack
+docker volume create elasticsearch-data
+
+# Prometheus & Grafana
+# Note: Prometheus data is often considered ephemeral,
+# but we will persist it.
+docker volume create grafana-data
+
+echo "--- Volume creation complete ---"
+docker volume ls
+```
+
+### Deconstruction
+
+* `docker volume create gitlab-data`: This is our "rent a storage locker" command. It tells the Docker daemon to create a new, managed volume named `gitlab-data`. Docker will create a directory for this in its private, protected area (e.g., `/var/lib/docker/volumes/gitlab-data/_data`).
+* We create specific volumes for each service's needs (e.g., `gitlab-data` and `gitlab-logs` for GitLab, `sonarqube-data` and `sonarqube-extensions` for SonarQube).
+
+### Action and Verification
+
+From *inside your `dev-container`*, make the script executable and run it.
+
+```bash
+# (Inside dev-container)
+chmod +x 03-create-volumes.sh
+./03-create-volumes.sh
+```
+
+**Result:**
+The script will list all the volumes you just created. The final `docker volume ls` command will provide a clean list, proving that our "storage lockers" are now provisioned and ready to be used by our services.
+
+## 4.4 Step 3: Connect the "Control Center"
+
+We have now built our "road network" (`cicd-net`) and laid all our "foundations" (the volumes and bind mount directories).
+
+The final and most important step is to connect our "Control Center" (`dev-container`) to this new "city network." This is the entire point of our setup. Attaching our `dev-container` to `cicd-net` is what will allow our Python automation scripts to find, ping, and communicate with `gitlab`, `jenkins`, and all the other services we will deploy.
+
+### The "Backward Compatibility" Logic
+
+We must modify our `dev-container.sh` script. However, we will add a small guard to make our script more robust. We will add logic to check if the `cicd-net` network actually exists.
+
+1.  If it *does* exist, we will connect the container to it using `--network cicd-net`.
+2.  If it *does not* exist (perhaps because a user skipped a step), we will do nothing, allowing the container to attach to the default `bridge` network as it did before. This prevents the script from failing.
+
+### Action
+
+First, from your **host machine's terminal**, stop your running `dev-container`.
+
+```bash
+# (Run on HOST)
+docker stop dev-container
+```
+
+Next, open your `dev-container.sh` script with your text editor. We will add a logic block to check for the network and add the `--network` flag to our `docker run` command.
+
+**Your modified `dev-container.sh` should look like this:**
+
+```bash
+#!/usr/bin/env bash
+source ./dev.conf
+
+USERNAME="$USER"
+GPU_FLAG=""
+NETWORK_FLAG="" # <-- ADD THIS LINE
+
+# --- ADD THIS LOGIC BLOCK ---
+# Check if the 'cicd-net' network exists
+if docker network ls | grep -q "cicd-net"; then
+    echo "--- Attaching to 'cicd-net' network ---"
+    NETWORK_FLAG="--network cicd-net"
+else
+    echo "--- 'cicd-net' network not found. Attaching to default network. ---"
+fi
+# --- END OF BLOCK ---
+
+
+# Conditionally add the --gpus flag
+if [ "$ENABLE_GPU_SUPPORT" = "true" ]; then
+    GPU_FLAG="--gpus all"
+fi
+
+# ... (mkdir logic) ...
+mkdir -p repos data articles viewer
+
+docker run -it \
+  --name "dev-container" \
+  --restart always \
+  $NETWORK_FLAG \   # <-- ADD THIS LINE
+  --cap-add=SYS_NICE \
+  --cap-add=SYS_PTRACE \
+  $GPU_FLAG \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$(pwd)/articles:/home/$USERNAME/articles" \
+  -v "$(pwd)/viewer:/home/$USERNAME/viewer" \
+  -v "$(pwd)/data:/home/$USERNAME/data" \
+  -v "$(pwd)/repos:/home/$USERNAME/repos" \
+  -p 127.0.0.1:10200:22 \
+  -p 127.0.0.1:10201:8888 \
+  -p 127.0.0.1:10202:8889 \
+  dev-container:latest
+```
+
+**[PERMALINK: `dev-container.sh` - Add network check logic and `--network` flag](https://github.com/InfiniteConsult/FromFirstPrinciples/blob/c3a465657ad6622262502fdf0f9467b16aa0fa1e/dev-container.sh#L9)**
+
+### Final Action and Verification
+
+Save the file. Now, from your **host machine**, re-run the script.
+
+```bash
+# (Run on HOST)
+# First, make sure the old container is gone
+docker rm dev-container
+
+# Now, run the modified script
+./dev-container.sh
+```
+
+**Result:**
+You will see the new message: `--- Attaching to 'cicd-net' network ---` before the container starts.
+
+Now, let's verify the connection from *inside* the `dev-container`.
+
+```bash
+# (Inside dev-container)
+# 1. Enter the container
+docker exec -it dev-container bash
+
+# 2. Inspect your own container's network settings
+docker inspect dev-container
+```
+
+Scroll down in the JSON output until you find the `"Networks"` block. You will now see that your container is attached to `cicd-net` and has an IP address in the `172.30.0.0/24` subnet we defined.
+
+**Result (snippet):**
+
+```json
+        "Networks": {
+            "cicd-net": {
+                "IPAMConfig": null,
+                "Links": null,
+                "Aliases": [
+                    "078bebdffeac"
+                ],
+                "NetworkID": "...",
+                "EndpointID": "...",
+                "Gateway": "172.30.0.1",
+                "IPAddress": "172.30.0.2",
+                "IPPrefixLen": 24,
+                ...
+            }
+        }
+```
+
+**Explanation:** This confirms our "Control Center" is successfully connected to our "CI/CD City" network. It can now act as our central orchestrator for all other services.
